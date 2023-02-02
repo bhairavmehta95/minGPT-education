@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from einops import rearrange, reduce, asnumpy, parse_shape
+
 from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
@@ -37,9 +39,12 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.w_qs = nn.Linear(config.n_embd, config.n_embd)
+        self.w_ks = nn.Linear(config.n_embd, config.n_embd)
+        self.w_vs = nn.Linear(config.n_embd, config.n_embd)
+
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.w_proj = nn.Linear(config.n_embd, config.n_embd)
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -52,22 +57,21 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = rearrange(self.w_qs(x), 'b l (head k) -> head b l k', head=self.n_head)
+        k = rearrange(self.w_ks(x), 'b t (head k) -> head b t k', head=self.n_head)
+        v = rearrange(self.w_vs(x), 'b t (head v) -> head b t v', head=self.n_head)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = torch.einsum('hblk,hbtk->hblt', [q, k]) * (1.0 / math.sqrt(k.size(-1)))
+
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        y = torch.einsum('hblt,hbtv->hblv', [att, v])
+        y = rearrange(y, 'head b l v -> b l (head v)')
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.w_proj(y))
         return y
 
 class Block(nn.Module):
@@ -153,7 +157,7 @@ class GPT(nn.Module):
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if pn.endswith('w_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
@@ -170,47 +174,6 @@ class GPT(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """
-        Initialize a pretrained GPT model by copying over the weights
-        from a huggingface/transformers checkpoint.
-        """
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-
-        # create a from-scratch initialized minGPT model
-        config = cls.get_default_config()
-        config.model_type = model_type
-        config.vocab_size = 50257 # openai's model vocabulary
-        config.block_size = 1024  # openai's model block_size
-        model = GPT(config)
-        sd = model.state_dict()
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
-        # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
-        for k in keys:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
 
     def configure_optimizers(self, train_config):
         """
